@@ -1,0 +1,430 @@
+import argparse
+import gzip
+import logging
+import random
+import re
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Iterable, List, Sequence, Tuple
+
+import numpy as np
+from gensim.models import Word2Vec
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import accuracy_score, classification_report, f1_score
+from sklearn.model_selection import train_test_split
+from sklearn.svm import LinearSVC
+
+
+# база
+
+_RU_TOKEN_RE = re.compile(r"[а-яё]+", flags=re.IGNORECASE)
+
+RU_STOPWORDS = {
+    "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то",
+    "все", "она", "так", "его", "но", "да", "ты", "к", "у", "же", "вы", "за",
+    "бы", "по", "ее", "мне", "было", "вот", "от", "меня", "еще", "нет", "о",
+    "из", "ему", "теперь", "когда", "даже", "ну", "вдруг", "ли", "если", "уже",
+    "или", "ни", "быть", "был", "него", "до", "вас", "нибудь", "опять", "уж",
+    "вам", "ведь", "там", "потом", "себя", "ничего", "ей", "может", "они",
+    "тут", "где", "есть", "надо", "ней", "для", "мы", "тебя", "их", "чем",
+    "была", "сам", "чтоб", "без", "будто", "чего", "раз", "тоже", "себе",
+    "под", "будет", "ж", "тогда", "кто", "этот", "того", "потому", "этого",
+    "какой", "совсем", "ним", "здесь", "этом", "один", "почти", "мой", "тем",
+    "чтобы", "нее", "сейчас", "были", "куда", "зачем", "всех", "никогда",
+}
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def read_news_tsv_gz(path: str) -> Tuple[List[str], List[str]]:
+
+    texts: List[str] = []
+    labels: List[str] = []
+
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+
+            label, title, body = parts[0], parts[1], parts[2]
+            labels.append(label)
+            texts.append(f"{title} {body}")
+
+    return texts, labels
+
+
+# токенизация/лемматизация 
+
+@dataclass(frozen=True)
+class TextPreprocessor:
+    use_lemma: bool = True
+    drop_stopwords: bool = True
+    min_token_len: int = 2
+
+    def __post_init__(self) -> None:
+        if self.use_lemma:
+            try:
+                import pymorphy2  # noqa: F401
+            except Exception as e:
+                raise RuntimeError(
+                    "Включена лемматизация, но pymorphy2 не установлен.\n"
+                    "pip install pymorphy2 pymorphy2-dicts-ru\n"
+                    "Либо --no-lemma."
+                ) from e
+
+    @staticmethod
+    @lru_cache(maxsize=200_000)
+    def _lemma_cached(token: str) -> str:
+        import pymorphy2
+        morph = getattr(TextPreprocessor._lemma_cached, "_morph", None)
+        if morph is None:
+            morph = pymorphy2.MorphAnalyzer()
+            setattr(TextPreprocessor._lemma_cached, "_morph", morph)
+
+        return morph.parse(token)[0].normal_form
+
+    def tokenize(self, text: str) -> List[str]:
+        text = text.lower()
+        tokens = _RU_TOKEN_RE.findall(text)
+
+        out: List[str] = []
+        for t in tokens:
+            if len(t) < self.min_token_len:
+                continue
+            if self.drop_stopwords and t in RU_STOPWORDS:
+                continue
+            if self.use_lemma:
+                t = self._lemma_cached(t)
+                if self.drop_stopwords and t in RU_STOPWORDS:
+                    continue
+            out.append(t)
+
+        return out
+
+
+# Word2Vec обучение
+
+@dataclass(frozen=True)
+class W2VConfig:
+    vector_size: int = 100
+    window: int = 5
+    min_count: int = 3
+    epochs: int = 10
+    sg: int = 1          # 1 = skip-gram, 0 = cbow
+    workers: int = 1     # 1 для воспроизводимости
+
+
+def train_word2vec(docs_tokens: Sequence[Sequence[str]], cfg: W2VConfig, seed: int) -> Word2Vec:
+    model = Word2Vec(
+        sentences=list(docs_tokens),
+        vector_size=cfg.vector_size,
+        window=cfg.window,
+        min_count=cfg.min_count,
+        sg=cfg.sg,
+        workers=cfg.workers,
+        seed=seed,
+    )
+    model.train(list(docs_tokens), total_examples=len(docs_tokens), epochs=cfg.epochs)
+    return model
+
+
+def _mean_pool(vectors: np.ndarray) -> np.ndarray:
+    return vectors.mean(axis=0)
+
+
+def _safe_zero(dim: int) -> np.ndarray:
+    return np.zeros(dim, dtype=np.float32)
+
+
+# векторизаторы документов
+
+class MeanW2V:
+    name = "mean_w2v"
+
+    def __init__(self, w2v: Word2Vec):
+        self.w2v = w2v
+        self.dim = w2v.vector_size
+
+    def fit(self, _: Sequence[Sequence[str]]) -> "MeanW2V":
+        return self
+
+    def transform(self, docs: Sequence[Sequence[str]]) -> np.ndarray:
+        out = np.zeros((len(docs), self.dim), dtype=np.float32)
+        for i, words in enumerate(docs):
+            vecs = [self.w2v.wv[w] for w in words if w in self.w2v.wv]
+            if vecs:
+                out[i] = _mean_pool(np.asarray(vecs, dtype=np.float32))
+        return out
+
+
+class TfidfW2V:
+    name = "tfidf_w2v"
+
+    def __init__(self, w2v: Word2Vec, min_df: int = 2):
+        self.w2v = w2v
+        self.dim = w2v.vector_size
+        self.min_df = min_df
+
+        self._tfidf: TfidfVectorizer | None = None
+        self._feature_names: np.ndarray | None = None
+
+    @staticmethod
+    def _identity(x):
+        return x
+
+    def fit(self, train_docs: Sequence[Sequence[str]]) -> "TfidfW2V":
+        tfidf = TfidfVectorizer(
+            tokenizer=self._identity,
+            preprocessor=self._identity,
+            token_pattern=None,
+            min_df=self.min_df,
+        )
+        tfidf.fit(train_docs)
+
+        self._tfidf = tfidf
+        self._feature_names = np.asarray(tfidf.get_feature_names_out())
+        return self
+
+    def transform(self, docs: Sequence[Sequence[str]]) -> np.ndarray:
+        if self._tfidf is None or self._feature_names is None:
+            raise RuntimeError("TfidfW2V: сначала вызови fit().")
+
+        X = np.zeros((len(docs), self.dim), dtype=np.float32)
+        M = self._tfidf.transform(docs)
+
+        for i in range(M.shape[0]):
+            row = M.getrow(i)
+            if row.nnz == 0:
+                continue
+
+            weighted = []
+            for idx, val in zip(row.indices, row.data):
+                w = self._feature_names[idx]
+                if w in self.w2v.wv:
+                    weighted.append(self.w2v.wv[w] * float(val))
+
+            if weighted:
+                X[i] = _mean_pool(np.asarray(weighted, dtype=np.float32))
+
+        return X
+
+
+class SIFW2V:
+    name = "sif_w2v"
+
+    def __init__(self, w2v: Word2Vec, a: float = 1e-3):
+        self.w2v = w2v
+        self.dim = w2v.vector_size
+        self.a = float(a)
+
+        self._pw: dict[str, float] = {}
+        self._pc: np.ndarray | None = None
+
+    def fit(self, train_docs: Sequence[Sequence[str]]) -> "SIFW2V":
+        # частоты на train
+        counts: dict[str, int] = {}
+        total = 0
+
+        for doc in train_docs:
+            for w in doc:
+                total += 1
+                counts[w] = counts.get(w, 0) + 1
+
+        if total == 0:
+            self._pw = {}
+            self._pc = None
+            return self
+
+        self._pw = {w: c / total for w, c in counts.items()}
+
+        # строим сырые SIF-вектора на train и ищем 1-ю компоненту
+        X_raw = self._sif_average(train_docs, remove_pc=False)
+
+        # если все нули
+        if not np.any(X_raw):
+            self._pc = None
+            return self
+
+        svd = TruncatedSVD(n_components=1, random_state=42)
+        svd.fit(X_raw)
+        pc = svd.components_[0].astype(np.float32)
+
+        norm = float(np.linalg.norm(pc))
+        self._pc = pc / norm if norm > 0 else None
+        return self
+
+    def transform(self, docs: Sequence[Sequence[str]]) -> np.ndarray:
+        return self._sif_average(docs, remove_pc=True)
+
+    def _weight(self, w: str) -> float:
+        p = self._pw.get(w, 0.0)
+        return self.a / (self.a + p) if p > 0 else 1.0
+
+    def _sif_average(self, docs: Sequence[Sequence[str]], remove_pc: bool) -> np.ndarray:
+        X = np.zeros((len(docs), self.dim), dtype=np.float32)
+
+        for i, words in enumerate(docs):
+            vecs = []
+            weights = []
+
+            for w in words:
+                if w in self.w2v.wv:
+                    vecs.append(self.w2v.wv[w])
+                    weights.append(self._weight(w))
+
+            if not vecs:
+                continue
+
+            V = np.asarray(vecs, dtype=np.float32)
+            w = np.asarray(weights, dtype=np.float32)
+
+            # деление на сумму весов чтобы ограничить длину дока
+            denom = float(w.sum())
+            if denom > 0:
+                X[i] = (V * w[:, None]).sum(axis=0) / denom
+            else:
+                X[i] = _mean_pool(V)
+
+        if remove_pc and self._pc is not None and np.any(X):
+            pc = self._pc
+            # X - pc * (X·pc)
+            proj = (X @ pc).reshape(-1, 1)
+            X = X - proj * pc.reshape(1, -1)
+
+        return X
+
+
+# обучение
+
+def train_and_eval(
+    X_train: np.ndarray,
+    y_train: Sequence[str],
+    X_test: np.ndarray,
+    y_test: Sequence[str],
+    seed: int,
+) -> dict:
+    clf = LinearSVC(
+        C=1.0,
+        class_weight="balanced",
+        random_state=seed,
+    )
+    clf.fit(X_train, y_train)
+    pred = clf.predict(X_test)
+
+    return {
+        "acc": accuracy_score(y_test, pred),
+        "f1_macro": f1_score(y_test, pred, average="macro"),
+        "report": classification_report(y_test, pred, zero_division=0),
+    }
+
+
+# main
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Word2Vec + SVM классификация текстов (baseline vs improved doc embeddings)")
+    p.add_argument("--data", type=str, default="news.txt.gz", help="Путь к news.txt.gz (label\\ttitle\\ttext)")
+    p.add_argument("--seed", type=int, default=42, help="Seed для воспроизводимости")
+    p.add_argument("--test-size", type=float, default=0.2, help="Доля тестовой выборки")
+    p.add_argument("--no-lemma", action="store_true", help="Не лемматизировать токены")
+    p.add_argument("--keep-stopwords", action="store_true", help="Не удалять стоп-слова")
+    p.add_argument("--vector-size", type=int, default=100, help="Размерность Word2Vec")
+    p.add_argument("--min-count", type=int, default=3, help="min_count для Word2Vec")
+    p.add_argument("--window", type=int, default=5, help="window для Word2Vec")
+    p.add_argument("--epochs", type=int, default=10, help="epochs для Word2Vec")
+    p.add_argument("--workers", type=int, default=1, help="workers для Word2Vec (1 = максимально воспроизводимо)")
+    p.add_argument("--sif-a", type=float, default=1e-3, help="параметр a для SIF")
+    p.add_argument("--tfidf-min-df", type=int, default=2, help="min_df для TF-IDF (в TFIDF+W2V)")
+    p.add_argument("--log-level", type=str, default="INFO", help="DEBUG/INFO/WARNING/ERROR")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(levelname)s: %(message)s",
+    )
+    log = logging.getLogger("w2v_svm")
+
+    set_seed(args.seed)
+
+    log.info("Читаю данные: %s", args.data)
+    texts, labels = read_news_tsv_gz(args.data)
+    if not texts:
+        raise RuntimeError("Пустой датасет: проверьте путь и формат файла.")
+
+    prep = TextPreprocessor(
+        use_lemma=not args.no_lemma,
+        drop_stopwords=not args.keep_stopwords,
+    )
+
+    log.info("Токенизизация (%sлеммы, %sстоп-слова)...",
+             "" if prep.use_lemma else "без ",
+             "без " if not prep.drop_stopwords else "")
+
+    docs = [prep.tokenize(t) for t in texts]
+
+    # split что бы без утечек
+    X_tr_docs, X_te_docs, y_tr, y_te = train_test_split(
+        docs,
+        labels,
+        test_size=args.test_size,
+        random_state=args.seed,
+        stratify=labels,
+    )
+
+    cfg = W2VConfig(
+        vector_size=args.vector_size,
+        window=args.window,
+        min_count=args.min_count,
+        epochs=args.epochs,
+        sg=1,
+        workers=args.workers,
+    )
+
+    log.info("Word2Vec на train (%d документов)...", len(X_tr_docs))
+    w2v = train_word2vec(X_tr_docs, cfg=cfg, seed=args.seed)
+
+    vectorizers = [
+        MeanW2V(w2v),
+        TfidfW2V(w2v, min_df=args.tfidf_min_df),
+        SIFW2V(w2v, a=args.sif_a),
+    ]
+
+    results = []
+
+    for vec in vectorizers:
+        log.info("Векторизация документов: %s", vec.name)
+        vec.fit(X_tr_docs)
+
+        X_tr = vec.transform(X_tr_docs)
+        X_te = vec.transform(X_te_docs)
+
+        log.info("SVM: обучение и оценка (%s)", vec.name)
+        res = train_and_eval(X_tr, y_tr, X_te, y_te, seed=args.seed)
+
+        results.append((vec.name, res))
+        print("\n" + "=" * 72)
+        print(f"METHOD: {vec.name}")
+        print(f"accuracy : {res['acc']:.4f}")
+        print(f"f1_macro : {res['f1_macro']:.4f}")
+        print(res["report"].strip())
+
+    print("\n" + "-" * 72)
+    print("Сводка (чем выше — тем лучше):")
+    for name, res in results:
+        print(f"{name:>12} | acc={res['acc']:.4f} | f1_macro={res['f1_macro']:.4f}")
+
+
+if __name__ == "__main__":
+    main()
